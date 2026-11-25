@@ -1,0 +1,764 @@
+
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GYX 猪肉奔跑小游戏</title>
+
+<style>
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: #101827;
+  color: white;
+  font-family: Arial, sans-serif;
+}
+
+main {
+  max-width: 1040px;
+  margin: auto;
+  padding: 18px;
+}
+
+h1 {
+  font-size: 25px;
+}
+
+canvas {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  display: block;
+  border: 3px solid #405d7b;
+  border-radius: 12px;
+  background: skyblue;
+}
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 15px 0;
+}
+
+button {
+  padding: 12px 18px;
+  border: none;
+  border-radius: 8px;
+  background: #2576c2;
+  color: white;
+  font-size: 16px;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #3e92df;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+#status {
+  color: #ffe69b;
+  line-height: 1.7;
+}
+
+#info {
+  line-height: 1.8;
+  color: #d3e4fa;
+}
+</style>
+</head>
+
+<body>
+
+<main>
+
+<h1>🥩 GYX 体感猪肉奔跑</h1>
+
+<canvas id="game" width="960" height="540"></canvas>
+
+<div class="controls">
+  <button id="cameraButton">开启体感识别</button>
+  <button id="jumpButton">跳跃（测试）</button>
+  <button id="stopButton">停止（测试）</button>
+  <button id="restartButton">重新开始</button>
+</div>
+
+<p id="status">游戏已开始，角色正在自动奔跑。</p>
+
+<div id="info">
+  <p>全局变量 gyx：<strong id="gyxText">0</strong></p>
+  <p>
+    左手下垂，右手平伸：gyx = "1"，跳跃并继续移动。<br>
+    右手下垂，左手平伸：gyx = "2"，停止移动。<br>
+    其他姿势：gyx 保持不变。
+  </p>
+  <p>键盘测试：空格跳跃，S 停止，R 重新开始。</p>
+</div>
+
+</main>
+
+<!-- 使用你已经上传的原始体感库 -->
+<script src="./show.js"></script>
+
+<script>
+"use strict";
+
+// ========================================
+// 游戏画布
+// ========================================
+
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+
+const statusText = document.getElementById("status");
+const gyxText = document.getElementById("gyxText");
+
+const WIDTH = 960;
+const HEIGHT = 540;
+const GROUND_Y = 420;
+
+const RUN_SPEED = 250;
+const GRAVITY = 1800;
+const JUMP_POWER = -780;
+
+const PLAYER_WIDTH = 38;
+const PLAYER_HEIGHT = 56;
+
+// ========================================
+// 游戏状态
+// ========================================
+
+let player;
+let platforms;
+let porkItems;
+
+let cameraX = 0;
+let porkCount = 0;
+let distance = 0;
+
+let isStopped = false;
+let isDead = false;
+
+let lastGyx = "0";
+let generatedEnd = 0;
+let platformIndex = 0;
+
+// ========================================
+// 创建游戏
+// ========================================
+
+function restartGame() {
+  player = {
+    x: 120,
+    y: GROUND_Y - PLAYER_HEIGHT,
+    width: PLAYER_WIDTH,
+    height: PLAYER_HEIGHT,
+    velocityY: 0,
+    grounded: true
+  };
+
+  platforms = [
+    { start: 0, end: 920 }
+  ];
+
+  porkItems = [
+    { x: 340, y: 335, collected: false },
+    { x: 570, y: 315, collected: false },
+    { x: 760, y: 340, collected: false }
+  ];
+
+  cameraX = 0;
+  porkCount = 0;
+  distance = 0;
+
+  isStopped = false;
+  isDead = false;
+
+  generatedEnd = 920;
+  platformIndex = 0;
+
+  lastGyx = String(window.gyx ?? "0");
+
+  generateWorld();
+
+  statusText.textContent =
+    "游戏开始！角色正在自动向右奔跑。";
+}
+
+// ========================================
+// 生成平台、断坑与猪肉
+// ========================================
+
+function generateWorld() {
+  while (generatedEnd < player.x + 2500) {
+    const gapWidth = 100 + (platformIndex % 3) * 18;
+    const groundLength = 470 + (platformIndex % 4) * 80;
+
+    const start = generatedEnd + gapWidth;
+    const end = start + groundLength;
+
+    platforms.push({ start, end });
+
+    // 空中猪肉
+    porkItems.push({
+      x: start + 85,
+      y: GROUND_Y - 85,
+      collected: false
+    });
+
+    porkItems.push({
+      x: start + 220,
+      y: GROUND_Y - 120,
+      collected: false
+    });
+
+    porkItems.push({
+      x: start + 350,
+      y: GROUND_Y - 80,
+      collected: false
+    });
+
+    // 断坑上方也可能出现猪肉
+    porkItems.push({
+      x: generatedEnd + gapWidth / 2,
+      y: GROUND_Y - 140,
+      collected: false
+    });
+
+    generatedEnd = end;
+    platformIndex++;
+  }
+}
+
+// ========================================
+// 跳跃
+// ========================================
+
+function jump() {
+  if (isDead) return;
+
+  // gyx = 1 也可以让停止的角色继续奔跑
+  isStopped = false;
+
+  if (player.grounded) {
+    player.velocityY = JUMP_POWER;
+    player.grounded = false;
+  }
+
+  statusText.textContent = "正在奔跑 / 跳跃。";
+}
+
+// ========================================
+// 停止
+// ========================================
+
+function stopPlayer() {
+  if (isDead) return;
+
+  isStopped = true;
+  statusText.textContent = "角色已停止。";
+}
+
+// ========================================
+// 读取 show.js 的全局变量
+// ========================================
+
+function readGyx() {
+  const currentGyx = String(window.gyx ?? "0");
+
+  gyxText.textContent = currentGyx;
+
+  // 只在 gyx 值发生变化时触发动作。
+  // 保持为 1 不会无限重复跳跃。
+
+  if (currentGyx !== lastGyx) {
+    if (currentGyx === "1") {
+      jump();
+    }
+    else if (currentGyx === "2") {
+      stopPlayer();
+    }
+  }
+
+  lastGyx = currentGyx;
+}
+
+// ========================================
+// 检测玩家脚下是否有地面
+// ========================================
+
+function findGround(x) {
+  for (const platform of platforms) {
+    if (
+      x >= platform.start &&
+      x <= platform.end
+    ) {
+      return platform;
+    }
+  }
+
+  return null;
+}
+
+// ========================================
+// 检测收集猪肉
+// ========================================
+
+function collectPork() {
+  const px = player.x + player.width / 2;
+  const py = player.y + player.height / 2;
+
+  for (const item of porkItems) {
+    if (item.collected) continue;
+
+    const dx = Math.abs(px - item.x);
+    const dy = Math.abs(py - item.y);
+
+    if (dx < 32 && dy < 43) {
+      item.collected = true;
+      porkCount++;
+    }
+  }
+}
+
+// ========================================
+// 游戏逻辑
+// ========================================
+
+function update(dt) {
+  // 每帧读取一次 gyx
+  readGyx();
+
+  if (isDead || isStopped) return;
+
+  const oldBottom = player.y + player.height;
+
+  // 自动向右奔跑
+  player.x += RUN_SPEED * dt;
+
+  // 重力
+  player.velocityY += GRAVITY * dt;
+  player.y += player.velocityY * dt;
+
+  player.grounded = false;
+
+  const newBottom = player.y + player.height;
+
+  // 检测落地
+  if (
+    player.velocityY >= 0 &&
+    oldBottom <= GROUND_Y + 4 &&
+    newBottom >= GROUND_Y
+  ) {
+    const ground = findGround(
+      player.x + player.width / 2
+    );
+
+    if (ground) {
+      player.y = GROUND_Y - player.height;
+      player.velocityY = 0;
+      player.grounded = true;
+    }
+  }
+
+  // 掉进断坑
+  if (player.y > HEIGHT + 60) {
+    isDead = true;
+    statusText.textContent =
+      "游戏失败！你掉进断坑了。";
+    return;
+  }
+
+  collectPork();
+
+  // 不断生成新地图
+  generateWorld();
+
+  // 镜头跟随角色
+  cameraX = Math.max(0, player.x - 210);
+
+  distance = Math.floor(
+    Math.max(0, player.x - 120) / 10
+  );
+}
+
+// ========================================
+// 绘制天空
+// ========================================
+
+function drawSky() {
+  const gradient = ctx.createLinearGradient(
+    0, 0, 0, HEIGHT
+  );
+
+  gradient.addColorStop(0, "#6dc0fa");
+  gradient.addColorStop(1, "#d5f1ff");
+
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+  // 云
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+
+  for (let i = 0; i < 9; i++) {
+    const rawX = i * 235 - cameraX * 0.2;
+    const x = ((rawX % 1250) + 1250) % 1250 - 120;
+    const y = 75 + (i % 3) * 48;
+
+    ctx.beginPath();
+    ctx.ellipse(
+      x, y, 68, 21,
+      0, 0, Math.PI * 2
+    );
+    ctx.fill();
+  }
+
+  // 远山
+  ctx.fillStyle = "#91b7c2";
+
+  for (let i = 0; i < 13; i++) {
+    const rawX = i * 185 - cameraX * 0.35;
+    const x = ((rawX % 1300) + 1300) % 1300 - 140;
+
+    ctx.beginPath();
+    ctx.moveTo(x - 110, GROUND_Y);
+    ctx.lineTo(x, 260 + i % 3 * 20);
+    ctx.lineTo(x + 125, GROUND_Y);
+    ctx.closePath();
+    ctx.fill();
+  }
+}
+
+// ========================================
+// 绘制地面
+// ========================================
+
+function drawGround() {
+  for (const platform of platforms) {
+    const left = platform.start - cameraX;
+    const right = platform.end - cameraX;
+
+    if (right < 0 || left > WIDTH) continue;
+
+    const visibleLeft = Math.max(0, left);
+    const visibleRight = Math.min(WIDTH, right);
+    const width = visibleRight - visibleLeft;
+
+    if (width <= 0) continue;
+
+    // 泥土
+    ctx.fillStyle = "#805533";
+    ctx.fillRect(
+      visibleLeft, GROUND_Y,
+      width, HEIGHT - GROUND_Y
+    );
+
+    // 草地
+    ctx.fillStyle = "#65be57";
+    ctx.fillRect(
+      visibleLeft, GROUND_Y,
+      width, 17
+    );
+
+    // 泥土细节
+    ctx.fillStyle = "#543d2e";
+
+    for (
+      let x = visibleLeft + 20;
+      x < visibleRight;
+      x += 36
+    ) {
+      ctx.fillRect(x, GROUND_Y + 26, 13, 6);
+    }
+  }
+}
+
+// ========================================
+// 绘制猪肉
+// ========================================
+
+function drawPork() {
+  for (const item of porkItems) {
+    if (item.collected) continue;
+
+    const x = item.x - cameraX;
+    const y = item.y;
+
+    if (x < -50 || x > WIDTH + 50) continue;
+
+    // 猪肉
+    ctx.fillStyle = "#f4a5a5";
+    ctx.beginPath();
+    ctx.roundRect(
+      x - 16, y - 13,
+      30, 26, 8
+    );
+    ctx.fill();
+
+    ctx.fillStyle = "#d97780";
+    ctx.beginPath();
+    ctx.roundRect(
+      x - 11, y - 9,
+      19, 18, 6
+    );
+    ctx.fill();
+
+    // 骨头
+    ctx.fillStyle = "#fff0d7";
+    ctx.fillRect(x + 8, y + 3, 16, 7);
+
+    ctx.beginPath();
+    ctx.arc(
+      x + 24, y + 4,
+      5, 0, Math.PI * 2
+    );
+    ctx.fill();
+  }
+}
+
+// ========================================
+// 绘制玩家
+// ========================================
+
+function drawPlayer() {
+  const x = player.x - cameraX;
+  const y = player.y;
+
+  // 头
+  ctx.fillStyle = "#efbc92";
+  ctx.fillRect(x + 8, y, 23, 21);
+
+  // 头发
+  ctx.fillStyle = "#473223";
+  ctx.fillRect(x + 8, y, 23, 6);
+
+  // 眼睛
+  ctx.fillStyle = "#222";
+  ctx.fillRect(x + 24, y + 11, 4, 4);
+
+  // 上衣
+  ctx.fillStyle = "#2875c1";
+  ctx.fillRect(x + 5, y + 21, 29, 25);
+
+  // 腿
+  ctx.fillStyle = "#27334f";
+  ctx.fillRect(x + 6, y + 46, 11, 10);
+  ctx.fillRect(x + 24, y + 46, 11, 10);
+
+  // 手
+  ctx.fillStyle = "#efbc92";
+  ctx.fillRect(x + 33, y + 24, 5, 16);
+}
+
+// ========================================
+// 绘制分数与变量
+// ========================================
+
+function drawHUD() {
+  ctx.fillStyle = "rgba(11,29,51,0.82)";
+  ctx.fillRect(16, 15, 280, 95);
+
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 25px Arial";
+  ctx.fillText("猪肉: " + porkCount, 30, 53);
+
+  ctx.font = "19px Arial";
+  ctx.fillText("距离: " + distance + " m", 30, 87);
+
+  ctx.fillStyle = "rgba(11,29,51,0.82)";
+  ctx.fillRect(WIDTH - 180, 15, 165, 55);
+
+  ctx.fillStyle = "#fff";
+  ctx.font = "bold 21px Arial";
+  ctx.fillText(
+    "GYX: " + String(window.gyx ?? "0"),
+    WIDTH - 163,
+    50
+  );
+}
+
+// ========================================
+// 暂停与失败画面
+// ========================================
+
+function drawOverlay(title, subtitle) {
+  ctx.fillStyle = "rgba(12,25,45,0.87)";
+  ctx.beginPath();
+  ctx.roundRect(
+    WIDTH / 2 - 230,
+    HEIGHT / 2 - 90,
+    460, 170, 18
+  );
+  ctx.fill();
+
+  ctx.textAlign = "center";
+  ctx.fillStyle = "#fff";
+
+  ctx.font = "bold 34px Arial";
+  ctx.fillText(
+    title,
+    WIDTH / 2,
+    HEIGHT / 2 - 20
+  );
+
+  ctx.font = "19px Arial";
+  ctx.fillText(
+    subtitle,
+    WIDTH / 2,
+    HEIGHT / 2 + 28
+  );
+
+  ctx.textAlign = "left";
+}
+
+// ========================================
+// 主游戏循环
+// ========================================
+
+let previousTime = performance.now();
+
+function gameLoop(now) {
+  const dt = Math.min(
+    (now - previousTime) / 1000,
+    0.04
+  );
+
+  previousTime = now;
+
+  update(dt);
+
+  drawSky();
+  drawGround();
+  drawPork();
+  drawPlayer();
+  drawHUD();
+
+  if (isDead) {
+    drawOverlay(
+      "掉进断坑了！",
+      "点击重新开始，再挑战一次"
+    );
+  }
+  else if (isStopped) {
+    drawOverlay(
+      "角色已停止",
+      "做动作 1，跳跃并继续奔跑"
+    );
+  }
+
+  requestAnimationFrame(gameLoop);
+}
+
+// ========================================
+// 摄像头：调用现有 show.js
+// ========================================
+
+const cameraButton = document.getElementById(
+  "cameraButton"
+);
+
+cameraButton.addEventListener(
+  "click",
+  async function () {
+    if (
+      typeof window.A !== "function" ||
+      typeof window.B !== "function"
+    ) {
+      statusText.textContent =
+        "错误：show.js 未正确加载。";
+      return;
+    }
+
+    cameraButton.disabled = true;
+
+    statusText.textContent =
+      "正在启动摄像头和人体识别……";
+
+    try {
+      // 这两个函数来自你的 show.js
+      await window.A();
+      await window.B();
+
+      cameraButton.textContent = "体感识别已开启";
+
+      statusText.textContent =
+        "体感识别已启动！现在可以用手臂控制角色。";
+
+    } catch (error) {
+      cameraButton.disabled = false;
+
+      statusText.textContent =
+        "体感识别启动失败：" +
+        (error.message || String(error));
+    }
+  }
+);
+
+// ========================================
+// 测试按钮
+// 不修改原 show.js
+// ========================================
+
+document.getElementById("jumpButton")
+  .addEventListener("click", function () {
+    jump();
+  });
+
+document.getElementById("stopButton")
+  .addEventListener("click", function () {
+    stopPlayer();
+  });
+
+document.getElementById("restartButton")
+  .addEventListener("click", function () {
+    restartGame();
+  });
+
+// ========================================
+// 键盘测试
+// ========================================
+
+document.addEventListener(
+  "keydown",
+  function (event) {
+    if (
+      event.code === "Space" ||
+      event.code === "ArrowUp"
+    ) {
+      event.preventDefault();
+
+      if (!event.repeat) jump();
+    }
+
+    if (
+      event.code === "KeyS" ||
+      event.code === "ArrowDown"
+    ) {
+      event.preventDefault();
+      stopPlayer();
+    }
+
+    if (event.code === "KeyR") {
+      restartGame();
+    }
+  }
+);
+
+// ========================================
+// 启动游戏
+// ========================================
+
+restartGame();
+requestAnimationFrame(gameLoop);
+
+</script>
+
+</body>
+</html>
