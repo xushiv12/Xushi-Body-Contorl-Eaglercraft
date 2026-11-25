@@ -1,201 +1,544 @@
 
 /*
- * GYX browser library — port of lib(3).py pose classification.
- * Only updates the global window.gyx to "1" or "2" for matching poses.
- * No keyboard events, game actions, or camera preview.
- * Requires HTTPS or localhost and camera permission.
- * MediaPipe Tasks Vision runs in the browser; model is fetched on first start.
+ * GYX Body Control Library
  *
- * Usage (from a user-click handler):
- *   await A();
- *   await B();
- *   console.log(gyx);       // "0", "1", or "2"
- *   console.log(get_gyx()); // same value
- *   stop();                 // releases the camera
+ * Browser version of the original Python lib.py
+ *
+ * Action A:
+ * Left arm down, right arm horizontal
+ * window.gyx = "1"
+ *
+ * Action B:
+ * Right arm down, left arm horizontal
+ * window.gyx = "2"
+ *
+ * Other poses:
+ * Do not change window.gyx
+ *
+ * No game control or keyboard simulation.
+ *
+ * Public functions:
+ * A(), B(), start(), stop(),
+ * reset(), get_gyx(), get_error()
  */
+
 (function (root) {
   "use strict";
-  if (!root || !root.document) return;
 
-  // Original Python library uses strings, not numbers.
+  // ====================================
+  // Global variable
+  // ====================================
+
   root.gyx = "0";
+
+  // ====================================
+  // MediaPipe configuration
+  // ====================================
+
+  const VERSION = "0.10.32";
+
+  const MODULE_URL =
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@" +
+    VERSION + "/vision_bundle.mjs";
+
+  const WASM_URL =
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@" +
+    VERSION + "/wasm";
+
+  const MODEL_URL =
+    "https://storage.googleapis.com/" +
+    "mediapipe-models/pose_landmarker/" +
+    "pose_landmarker_lite/float16/1/" +
+    "pose_landmarker_lite.task";
+
+  // ====================================
+  // Body landmarks
+  // ====================================
 
   const LEFT = [11, 13, 15];
   const RIGHT = [12, 14, 16];
-  const MP_VERSION = "0.10.22";
-  const MP_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}/+esm`;
-  const WASM_URL = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}/wasm`;
-  const MODEL_URL =
-    "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+
+  // ====================================
+  // Internal state
+  // ====================================
 
   let enabledA = false;
   let enabledB = false;
+
   let video = null;
   let stream = null;
-  let landmarker = null;
+  let detector = null;
+
   let active = false;
-  let frameId = 0;
-  let runId = 0;
-  let lastTimestamp = -1;
+  let startupPromise = null;
+
+  let frameId = null;
+  let sessionId = 0;
+
   let lastVideoTime = -1;
-  let startup = null;
+  let lastTimestamp = -1;
+
   let errorMessage = "";
 
+  // ====================================
+  // Landmark visibility
+  // ====================================
+
   function visible(points, ...indices) {
-    return indices.every((i) => {
+    return indices.every(i => {
       const p = points[i];
-      return !!p && (p.visibility ?? 1) >= 0.5 && (p.presence ?? 1) >= 0.5;
+
+      return (
+        p !== undefined &&
+        p !== null &&
+        (p.visibility ?? 1) >= 0.5 &&
+        (p.presence ?? 1) >= 0.5
+      );
     });
   }
 
+  // ====================================
+  // Shoulder width
+  // ====================================
+
   function shoulderWidth(points) {
-    const a = points[11], b = points[12];
-    return Math.hypot(a.x - b.x, a.y - b.y);
+    const a = points[11];
+    const b = points[12];
+
+    return Math.hypot(
+      a.x - b.x,
+      a.y - b.y
+    );
   }
+
+  // ====================================
+  // Horizontal arm detection
+  // ====================================
 
   function horizontal(points, arm) {
     const [s, e, w] = arm;
-    if (!visible(points, 11, 12, s, e, w)) return false;
+
+    if (!visible(points, 11, 12, s, e, w)) {
+      return false;
+    }
+
     const width = shoulderWidth(points);
-    if (width < 0.045) return false;
-    const shoulder = points[s], elbow = points[e], wrist = points[w];
-    const midX = (points[11].x + points[12].x) / 2;
-    const outward = shoulder.x >= midX ? 1 : -1;
+
+    if (width < 0.045) {
+      return false;
+    }
+
+    const shoulder = points[s];
+    const elbow = points[e];
+    const wrist = points[w];
+
+    const midX =
+      (points[11].x + points[12].x) / 2;
+
+    const outward =
+      shoulder.x >= midX ? 1 : -1;
+
     return (
-      outward * (wrist.x - shoulder.x) > 0.75 * width &&
-      outward * (elbow.x - shoulder.x) > 0.24 * width &&
-      Math.abs(wrist.y - shoulder.y) < 0.38 * width &&
-      Math.abs(elbow.y - shoulder.y) < 0.32 * width &&
-      outward * (wrist.x - elbow.x) > 0.22 * width
+      outward *
+        (wrist.x - shoulder.x) >
+          0.75 * width &&
+
+      outward *
+        (elbow.x - shoulder.x) >
+          0.24 * width &&
+
+      Math.abs(
+        wrist.y - shoulder.y
+      ) < 0.38 * width &&
+
+      Math.abs(
+        elbow.y - shoulder.y
+      ) < 0.32 * width &&
+
+      outward *
+        (wrist.x - elbow.x) >
+          0.22 * width
     );
   }
+
+  // ====================================
+  // Downward arm detection
+  // ====================================
 
   function down(points, arm) {
     const [s, e, w] = arm;
-    if (!visible(points, 11, 12, s, e, w)) return false;
+
+    if (!visible(points, 11, 12, s, e, w)) {
+      return false;
+    }
+
     const width = shoulderWidth(points);
-    if (width < 0.045) return false;
-    const shoulder = points[s], elbow = points[e], wrist = points[w];
+
+    if (width < 0.045) {
+      return false;
+    }
+
+    const shoulder = points[s];
+    const elbow = points[e];
+    const wrist = points[w];
+
     return (
-      wrist.y - shoulder.y > 0.78 * width &&
-      elbow.y - shoulder.y > 0.28 * width &&
-      wrist.y - elbow.y > 0.18 * width &&
-      Math.abs(wrist.x - shoulder.x) < 0.65 * width &&
-      Math.abs(elbow.x - shoulder.x) < 0.50 * width
+      wrist.y - shoulder.y >
+        0.78 * width &&
+
+      elbow.y - shoulder.y >
+        0.28 * width &&
+
+      wrist.y - elbow.y >
+        0.18 * width &&
+
+      Math.abs(
+        wrist.x - shoulder.x
+      ) < 0.65 * width &&
+
+      Math.abs(
+        elbow.x - shoulder.x
+      ) < 0.50 * width
     );
   }
 
+  // ====================================
+  // Process detected pose
+  // ====================================
+
   function processLandmarks(points) {
-    if (!points) return;
-    if (enabledA && down(points, LEFT) && horizontal(points, RIGHT)) {
+    if (!points || points.length < 17) {
+      return;
+    }
+
+    // Action A
+    if (
+      enabledA &&
+      down(points, LEFT) &&
+      horizontal(points, RIGHT)
+    ) {
       root.gyx = "1";
-    } else if (enabledB && down(points, RIGHT) && horizontal(points, LEFT)) {
+    }
+
+    // Action B
+    else if (
+      enabledB &&
+      down(points, RIGHT) &&
+      horizontal(points, LEFT)
+    ) {
       root.gyx = "2";
     }
-    // All other poses: deliberately do NOTHING, keep previous gyx.
+
+    // Other poses:
+    // Keep the previous value.
   }
 
-  function onFrame(id) {
-    if (!active || id !== runId) return;
+  // ====================================
+  // Camera recognition loop
+  // ====================================
+
+  function recognizeFrame(id) {
+    if (!active || id !== sessionId) {
+      return;
+    }
+
     try {
-      if (video && video.readyState >= 2 && video.videoWidth > 0 &&
-          video.currentTime !== lastVideoTime) {
+      if (
+        video &&
+        detector &&
+        video.readyState >= 2 &&
+        video.videoWidth > 0 &&
+        video.currentTime !== lastVideoTime
+      ) {
         lastVideoTime = video.currentTime;
-        const timestamp = Math.max(lastTimestamp + 1, performance.now());
+
+        const timestamp = Math.max(
+          performance.now(),
+          lastTimestamp + 1
+        );
+
         lastTimestamp = timestamp;
-        const result = landmarker.detectForVideo(video, timestamp);
-        processLandmarks(result.landmarks?.[0] ?? null);
+
+        const result = detector.detectForVideo(
+          video,
+          timestamp
+        );
+
+        const points =
+          result.landmarks &&
+          result.landmarks.length > 0
+            ? result.landmarks[0]
+            : null;
+
+        processLandmarks(points);
       }
-    } catch (e) {
-      errorMessage = String(e?.message ?? e);
+
+    } catch (error) {
+      errorMessage =
+        error.message || String(error);
+
+      console.error(
+        "GYX recognition error:",
+        errorMessage
+      );
+
       stop();
       return;
     }
-    frameId = root.requestAnimationFrame(() => onFrame(id));
+
+    frameId = root.requestAnimationFrame(
+      () => recognizeFrame(id)
+    );
   }
 
+  // ====================================
+  // Start camera and MediaPipe
+  // ====================================
+
   async function start() {
-    if (active) return;
-    if (startup) return startup;
-    const id = ++runId;
+    if (active) {
+      return;
+    }
+
+    if (startupPromise) {
+      return startupPromise;
+    }
+
     errorMessage = "";
-    startup = (async () => {
+
+    const id = ++sessionId;
+
+    startupPromise = (async function () {
       try {
         if (!root.isSecureContext) {
-          throw new Error("摄像头需要 HTTPS 或 localhost 安全网页");
+          throw new Error(
+            "Camera requires HTTPS or localhost"
+          );
         }
-        if (!root.navigator?.mediaDevices?.getUserMedia) {
-          throw new Error("当前浏览器不支持 getUserMedia 摄像头接口");
+
+        if (
+          !navigator.mediaDevices ||
+          !navigator.mediaDevices.getUserMedia
+        ) {
+          throw new Error(
+            "Browser does not support camera access"
+          );
         }
-        // Ask permission immediately in the user's click, before loading model.
-        const localStream = await root.navigator.mediaDevices.getUserMedia({
-          audio: false,
-          video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: "user" }
-        });
-        if (id !== runId) {
-          localStream.getTracks().forEach((t) => t.stop());
+
+        // Request camera permission first.
+        const localStream =
+          await navigator.mediaDevices.getUserMedia({
+            audio: false,
+            video: {
+              width: { ideal: 640 },
+              height: { ideal: 480 },
+              facingMode: "user"
+            }
+          });
+
+        if (id !== sessionId) {
+          localStream.getTracks().forEach(
+            track => track.stop()
+          );
           return;
         }
+
         stream = localStream;
-        video = root.document.createElement("video");
+
+        video = document.createElement("video");
+
         video.autoplay = true;
         video.muted = true;
         video.playsInline = true;
         video.srcObject = stream;
+
         await video.play();
 
-        const { FilesetResolver, PoseLandmarker } = await import(MP_URL);
-        if (id !== runId) return;
-        const vision = await FilesetResolver.forVisionTasks(WASM_URL);
-        if (id !== runId) return;
-        const detector = await PoseLandmarker.createFromOptions(vision, {
-          baseOptions: { modelAssetPath: MODEL_URL, delegate: "CPU" },
-          runningMode: "VIDEO",
-          numPoses: 1,
-          minPoseDetectionConfidence: 0.5,
-          minPosePresenceConfidence: 0.5,
-          minTrackingConfidence: 0.5
-        });
-        if (id !== runId) { detector.close(); return; }
-        landmarker = detector;
-        active = true;
-        lastTimestamp = -1;
+        if (id !== sessionId) {
+          return;
+        }
+
+        // Load the actual MediaPipe ESM bundle.
+        const imported = await import(MODULE_URL);
+
+        if (id !== sessionId) {
+          return;
+        }
+
+        // Handle both named and default exports.
+        const vision =
+          imported.FilesetResolver
+            ? imported
+            : imported.default;
+
+        if (
+          !vision ||
+          !vision.FilesetResolver ||
+          !vision.PoseLandmarker
+        ) {
+          throw new Error(
+            "MediaPipe module exports are unavailable"
+          );
+        }
+
+        const {
+          FilesetResolver,
+          PoseLandmarker
+        } = vision;
+
+        // Load WASM runtime.
+        const fileset =
+          await FilesetResolver.forVisionTasks(
+            WASM_URL
+          );
+
+        if (id !== sessionId) {
+          return;
+        }
+
+        // Initialize pose detector.
+        const newDetector =
+          await PoseLandmarker.createFromOptions(
+            fileset,
+            {
+              baseOptions: {
+                modelAssetPath: MODEL_URL,
+                delegate: "CPU"
+              },
+
+              runningMode: "VIDEO",
+              numPoses: 1,
+
+              minPoseDetectionConfidence: 0.5,
+              minPosePresenceConfidence: 0.5,
+              minTrackingConfidence: 0.5
+            }
+          );
+
+        if (id !== sessionId) {
+          newDetector.close();
+          return;
+        }
+
+        detector = newDetector;
+
         lastVideoTime = -1;
-        frameId = root.requestAnimationFrame(() => onFrame(id));
-      } catch (e) {
-        if (id === runId) {
-          errorMessage = String(e?.message ?? e);
+        lastTimestamp = -1;
+
+        active = true;
+
+        console.log(
+          "GYX: Camera and pose recognition ready"
+        );
+
+        frameId = root.requestAnimationFrame(
+          () => recognizeFrame(id)
+        );
+
+      } catch (error) {
+        if (id === sessionId) {
+          errorMessage =
+            error.message || String(error);
+
+          console.error(
+            "GYX startup error:",
+            errorMessage
+          );
+
           stop();
         }
-        throw e;
+
+        throw error;
       }
     })();
+
     try {
-      await startup;
+      await startupPromise;
     } finally {
-      startup = null;
+      startupPromise = null;
     }
   }
 
+  // ====================================
+  // Stop recognition
+  // ====================================
+
   function stop() {
-    runId++;
+    sessionId++;
+
     active = false;
-    if (frameId) root.cancelAnimationFrame(frameId);
-    frameId = 0;
-    if (stream) stream.getTracks().forEach((track) => track.stop());
-    stream = null;
-    if (video) { video.pause(); video.srcObject = null; }
-    video = null;
-    if (landmarker) landmarker.close();
-    landmarker = null;
-    // Keep gyx; the original Python implementation also keeps last match.
+
+    if (frameId !== null) {
+      root.cancelAnimationFrame(frameId);
+      frameId = null;
+    }
+
+    if (stream) {
+      stream.getTracks().forEach(
+        track => track.stop()
+      );
+
+      stream = null;
+    }
+
+    if (video) {
+      video.pause();
+      video.srcObject = null;
+      video = null;
+    }
+
+    if (detector) {
+      detector.close();
+      detector = null;
+    }
+
+    // Do not reset gyx automatically.
   }
 
-  function reset() { root.gyx = "0"; }
-  function get_gyx() { return root.gyx; }
-  function get_error() { return errorMessage; }
-  async function A() { enabledA = true; await start(); return root.gyx === "1"; }
-  async function B() { enabledB = true; await start(); return root.gyx === "2"; }
+  // ====================================
+  // Public functions
+  // ====================================
 
-  Object.assign(root, { A, B, start, stop, reset, get_gyx, get_error });
+  function reset() {
+    root.gyx = "0";
+  }
+
+  function get_gyx() {
+    return root.gyx;
+  }
+
+  function get_error() {
+    return errorMessage;
+  }
+
+  async function A() {
+    enabledA = true;
+
+    await start();
+
+    return root.gyx === "1";
+  }
+
+  async function B() {
+    enabledB = true;
+
+    await start();
+
+    return root.gyx === "2";
+  }
+
+  // ====================================
+  // Export to global window
+  // ====================================
+
+  root.A = A;
+  root.B = B;
+
+  root.start = start;
+  root.stop = stop;
+
+  root.reset = reset;
+  root.get_gyx = get_gyx;
+  root.get_error = get_error;
+
 })(window);
